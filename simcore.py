@@ -379,21 +379,27 @@ def traffic_generator(txq_table, user_num, timestamp, rate_table, tx_info_table,
 class PPOConfig:
     user_num: int = 32
     queue_size: int = 2048            # 加大队列长度，减小溢出的概率
-    max_sim_time: float = 1e5         # 每个 episode 的最大仿真时间（毫秒）
+    max_sim_time: float = 1e2         # 每个 episode 的最大仿真时间（毫秒）
     gamma: float = 0.99
     lam: float = 0.95                 # GAE lambda
     clip_eps: float = 0.2
     lr: float = 3e-4
-    epochs: int = 10                  # 每个 episode 的 PPO 更新轮数
+    epochs: int = 100                  # 每个 episode 的 PPO 更新轮数
     rollout_steps: int = 1024         # 每轮收集的步数
     minibatch_size: int = 256
-    total_episodes: int = 500
+    total_episodes: int = 200
     w_vo: float = 5.0
     w_vi: float = 2.0
     w_be: float = 1.0
     seed: int = 42
     num_envs: int = 1                 # 向量环境个数，>1 时可以扩展为多进程
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Reward归一化配置
+    # 使用动态baseline：当前最大时延反映流量难度
+    # - 训练时：归一化reward，考虑流量难度
+    # - 评估时：原始reward，公平比较
+    normalize_reward: bool = True
 
 
 def set_global_seeds(seed: int):
@@ -414,13 +420,21 @@ class RLSchedulingEnv:
       * use_traditional=False：使用 RL 动作 (uid, tid)
     """
 
-    def __init__(self, config: PPOConfig, use_traditional: bool = False, enable_tracking: bool = False):
+    def __init__(self, config: PPOConfig, use_traditional: bool = False, enable_tracking: bool = False,
+                 normalize_reward: bool = True):
         self.cfg = config
         self.user_num = config.user_num
         self.queue_size = config.queue_size
         self.max_sim_time = config.max_sim_time
         self.use_traditional = use_traditional
         self.enable_tracking = enable_tracking
+        
+        # Reward归一化相关
+        self.normalize_reward = normalize_reward
+        self.reward_mean = 0.0
+        self.reward_var = 1.0
+        self.reward_count = 0
+        self.reward_m2 = 0.0  # 用于Welford算法计算running variance
 
         self.txq_table = None
         self.tx_info_table = None
@@ -435,6 +449,51 @@ class RLSchedulingEnv:
         self.obs_dim = self.user_num * 3 * 2 + 1
         self.act_dim = self.user_num * 3
 
+    def _normalize_reward(self, raw_reward: float, max_delay: float) -> float:
+        """
+        归一化reward，结合两种策略：
+        1. 相对当前最大时延的归一化（动态baseline）
+        2. Running mean/std归一化（使用Welford算法）
+        
+        使用最大时延作为baseline的好处：
+        - 不需要预计算传统调度的reward
+        - 反映当前流量的固有难度
+        - 计算简单高效
+        """
+        if not self.normalize_reward:
+            return raw_reward
+        
+        # 更新running statistics（Welford's online algorithm）
+        self.reward_count += 1
+        delta = raw_reward - self.reward_mean
+        self.reward_mean += delta / self.reward_count
+        delta2 = raw_reward - self.reward_mean
+        self.reward_m2 += delta * delta2
+        
+        if self.reward_count > 1:
+            self.reward_var = self.reward_m2 / (self.reward_count - 1)
+        
+        # 策略1：相对当前最大时延的归一化
+        # max_delay越大，说明当前流量难度越大
+        # 我们将reward相对于这个难度进行调整
+        if max_delay > 1.0:  # 避免除以接近0的值
+            # 难度越大，reward越负，但我们需要考虑难度因素
+            difficulty_factor = max_delay / 20.0  # VO阈值20ms作为参考
+            adjusted_reward = raw_reward / (1.0 + difficulty_factor)
+        else:
+            adjusted_reward = raw_reward
+        
+        # 策略2：Running mean/std归一化
+        if self.reward_count > 10:  # 积累一定样本后才归一化
+            reward_std = np.sqrt(self.reward_var) if self.reward_var > 0 else 1.0
+            normalized_reward = (adjusted_reward - self.reward_mean) / (reward_std + 1e-8)
+            # Clip到合理范围，防止极端值
+            normalized_reward = np.clip(normalized_reward, -10.0, 10.0)
+            return normalized_reward
+        else:
+            # 初期直接返回调整后的reward
+            return adjusted_reward
+    
     def reset(self, seed: int = None):
         """环境重置，初始化队列和事件"""
         if seed is not None:
@@ -688,10 +747,15 @@ class RLSchedulingEnv:
         if max_be > 100.0:
             timeout_penalty += 5.0 * (max_be - 100.0)
         
-        # 综合reward
+        # 综合reward（原始值）
         total_cost = delay_cost + timeout_penalty
         total_cost = min(total_cost, 500.0)
-        reward = -total_cost / 100.0
+        raw_reward = -total_cost / 100.0
+        
+        # 归一化reward（用于训练）
+        # 使用最大时延作为当前流量难度的指示
+        max_delay_overall = max(max_vo, max_vi, max_be)
+        normalized_reward = self._normalize_reward(raw_reward, max_delay_overall)
 
         # 5. 终止判断
         done = self.current_time > self.max_sim_time
@@ -706,6 +770,7 @@ class RLSchedulingEnv:
             "max_vi_delay": max_vi,
             "max_be_delay": max_be,
             "selected_empty_queue": selected_empty_queue if not self.use_traditional else False,
+            "raw_reward": raw_reward,  # 保存原始reward用于统计
         }
         
         # 记录到tracker
@@ -723,7 +788,8 @@ class RLSchedulingEnv:
             )
             self.tracker.add_record(record)
         
-        return obs, reward, done, info
+        # 返回归一化的reward用于训练
+        return obs, normalized_reward, done, info
 
 
 class ActorCritic(nn.Module):
@@ -759,8 +825,9 @@ def ppo_collect_rollout(env: RLSchedulingEnv,
                         device: torch.device):
     """
     收集一批 rollout 数据（单环境版本，方便理解；需要多核时可扩展为向量环境）
+    返回值增加 raw_rew_t 用于真实的reward统计
     """
-    obs_buf, act_buf, logp_buf, rew_buf, val_buf, done_buf = [], [], [], [], [], []
+    obs_buf, act_buf, logp_buf, rew_buf, raw_rew_buf, val_buf, done_buf = [], [], [], [], [], [], []
     obs = env.reset()
     for _ in range(cfg.rollout_steps):
         obs_t = torch.from_numpy(obs).to(device).unsqueeze(0)
@@ -774,7 +841,8 @@ def ppo_collect_rollout(env: RLSchedulingEnv,
         obs_buf.append(obs)
         act_buf.append(action.cpu().numpy())
         logp_buf.append(logp.cpu().numpy())
-        rew_buf.append(reward)
+        rew_buf.append(reward)  # 归一化后的reward用于训练
+        raw_rew_buf.append(info.get('raw_reward', reward))  # 原始reward用于统计
         val_buf.append(value.cpu().numpy())
         done_buf.append(done)
 
@@ -787,10 +855,11 @@ def ppo_collect_rollout(env: RLSchedulingEnv,
     act_t = torch.tensor(np.array(act_buf).squeeze(-1), dtype=torch.long, device=device)
     logp_t = torch.tensor(np.array(logp_buf).squeeze(-1), dtype=torch.float32, device=device)
     rew_t = torch.tensor(np.array(rew_buf), dtype=torch.float32, device=device)
+    raw_rew_t = torch.tensor(np.array(raw_rew_buf), dtype=torch.float32, device=device)
     val_t = torch.tensor(np.array(val_buf), dtype=torch.float32, device=device)
     done_t = torch.tensor(np.array(done_buf), dtype=torch.float32, device=device)
 
-    # GAE-Lambda 计算 advantage
+    # GAE-Lambda 计算 advantage（使用归一化后的reward）
     adv_buf = torch.zeros_like(rew_t, device=device)
     ret_buf = torch.zeros_like(rew_t, device=device)
     last_adv = 0.0
@@ -803,9 +872,14 @@ def ppo_collect_rollout(env: RLSchedulingEnv,
         last_ret = val_t[t] + last_adv
         ret_buf[t] = last_ret
 
+    # 保存未归一化的advantage和return用于统计分析
+    raw_adv_buf = adv_buf.clone()
+    raw_ret_buf = ret_buf.clone()
+    
+    # 对advantage进行归一化（用于训练）
     adv_buf = (adv_buf - adv_buf.mean()) / (adv_buf.std() + 1e-8)
 
-    return obs_t, act_t, logp_t, adv_buf, ret_buf
+    return obs_t, act_t, logp_t, adv_buf, ret_buf, raw_rew_t, raw_adv_buf, raw_ret_buf  # 返回原始数据用于统计
 
 
 def ppo_update(model: nn.Module,
@@ -851,40 +925,421 @@ def train_ppo(cfg: PPOConfig):
     set_global_seeds(cfg.seed)
 
     # 环境 & 模型
-    env = RLSchedulingEnv(cfg, use_traditional=False)
+    # 创建训练环境（启用reward归一化）
+    env = RLSchedulingEnv(cfg, use_traditional=False, normalize_reward=True)
     model = ActorCritic(env.obs_dim, env.act_dim).to(device)
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
 
-    episode_rewards = []
+    episode_rewards = []  # 训练过程中的reward（不同流量，不可直接比较）
+    eval_rewards = []  # 固定评估集的reward（可比较）
+    eval_improvement = []  # 相对于baseline的改善率
+    advantage_stats = []  # 记录每个episode的advantage统计信息（归一化后）
+    raw_advantage_stats = []  # 记录每个episode的原始advantage统计信息（未归一化）
+    raw_return_stats = []  # 记录每个episode的原始return统计信息（未归一化）
+    
+    # 固定评估集：每10个episode在相同流量下评估
+    eval_frequency = 10
+    eval_seeds = [1000, 1001, 1002]  # 3个固定的流量场景
+    
+    # 计算baseline（传统策略）在评估集上的性能作为参考
+    print("\n[评估] 计算baseline性能...")
+    baseline_rewards = []
+    for eval_seed in eval_seeds:
+        base_rew = evaluate_policy(cfg, model=None, use_traditional=True, 
+                                   seed=eval_seed, enable_tracking=False)
+        baseline_rewards.append(base_rew)
+    baseline_avg = np.mean(baseline_rewards)
+    print(f"[评估] Baseline平均reward: {baseline_avg:.6f}")
 
     # 使用 tqdm 展示 episode 进度
     for ep in tqdm(range(cfg.total_episodes), desc="PPO Training"):
-        # 收集一批 rollout
-        obs_t, act_t, logp_t, adv_t, ret_t = ppo_collect_rollout(env, model, cfg, device)
+        # 收集一批 rollout（随机流量训练）
+        obs_t, act_t, logp_t, adv_t, ret_t, raw_rew_t, raw_adv_t, raw_ret_t = ppo_collect_rollout(env, model, cfg, device)
 
-        # 估计该批次的平均 reward（粗略当作一个 episode 的回报统计）
+        # 训练过程的reward（仅供参考，因为流量每次不同）
         with torch.no_grad():
-            avg_ep_rew = ret_t.mean().item()
+            avg_ep_rew = raw_rew_t.mean().item()
+            
+            # 记录归一化后的advantage统计信息（训练质量指标）
+            adv_mean = adv_t.mean().item()
+            adv_std = adv_t.std().item()
+            adv_max = adv_t.max().item()
+            adv_min = adv_t.min().item()
+            
+            # 记录未归一化的advantage统计信息（真实的价值估计）
+            raw_adv_mean = raw_adv_t.mean().item()
+            raw_adv_std = raw_adv_t.std().item()
+            raw_adv_max = raw_adv_t.max().item()
+            raw_adv_min = raw_adv_t.min().item()
+            
+            # 记录未归一化的return统计信息（真实的累积回报）
+            raw_ret_mean = raw_ret_t.mean().item()
+            raw_ret_std = raw_ret_t.std().item()
+            raw_ret_max = raw_ret_t.max().item()
+            raw_ret_min = raw_ret_t.min().item()
+        
         episode_rewards.append(avg_ep_rew)
+        advantage_stats.append({
+            'mean': adv_mean,
+            'std': adv_std,
+            'max': adv_max,
+            'min': adv_min
+        })
+        raw_advantage_stats.append({
+            'mean': raw_adv_mean,
+            'std': raw_adv_std,
+            'max': raw_adv_max,
+            'min': raw_adv_min
+        })
+        raw_return_stats.append({
+            'mean': raw_ret_mean,
+            'std': raw_ret_std,
+            'max': raw_ret_max,
+            'min': raw_ret_min
+        })
 
         # PPO 更新
         ppo_update(model, optimizer, cfg, obs_t, act_t, logp_t, adv_t, ret_t, device)
+        
+        # 定期在固定评估集上测试（可比较的指标）
+        if (ep + 1) % eval_frequency == 0 or ep == 0:
+            eval_rews = []
+            for eval_seed in eval_seeds:
+                eval_rew = evaluate_policy(cfg, model, use_traditional=False, 
+                                           seed=eval_seed, enable_tracking=False)
+                eval_rews.append(eval_rew)
+            eval_avg = np.mean(eval_rews)
+            eval_rewards.append(eval_avg)
+            
+            # 计算相对于baseline的改善率
+            improvement = ((eval_avg - baseline_avg) / abs(baseline_avg)) * 100
+            eval_improvement.append(improvement)
+            
+            tqdm.write(f"Ep {ep+1}: 评估reward={eval_avg:.6f}, 相对baseline改善={improvement:+.2f}%")
 
-    # 画奖励收敛图
+    # 画奖励收敛图（折线图）
     os.makedirs("results", exist_ok=True)
-    plt.figure()
-    plt.plot(episode_rewards, label="Episode mean return")
-    plt.xlabel("Episode")
-    plt.ylabel("Return")
-    plt.title("PPO Training Reward Curve")
-    plt.grid(True)
-    plt.legend()
+    
+    # 图1：Reward曲线（分两个子图）
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+    
+    # 子图1：训练过程reward（随机流量，仅供参考）
+    axes[0].plot(episode_rewards, linewidth=1, alpha=0.5, label="Training reward (random traffic)")
+    axes[0].set_xlabel("Episode")
+    axes[0].set_ylabel("Average Reward")
+    axes[0].set_title("Training Reward (not directly comparable due to random traffic)")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+    axes[0].text(0.02, 0.98, "⚠️ 注意：每个episode流量不同，此曲线不能直接比较",
+                 transform=axes[0].transAxes, fontsize=9, verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.3))
+    
+    # 子图2：固定评估集reward（可比较）
+    eval_episodes = [i * eval_frequency for i in range(len(eval_rewards))]
+    if len(eval_episodes) > 0 and eval_episodes[0] != 0:
+        eval_episodes = [0] + eval_episodes
+    axes[1].plot(eval_episodes, eval_rewards, linewidth=2, marker='o', markersize=6,
+                 label="Evaluation reward (fixed traffic)", color='green')
+    axes[1].axhline(y=baseline_avg, color='red', linestyle='--', linewidth=2,
+                    label=f'Baseline (traditional): {baseline_avg:.6f}', alpha=0.7)
+    axes[1].set_xlabel("Episode")
+    axes[1].set_ylabel("Average Reward")
+    axes[1].set_title("Evaluation Reward on Fixed Traffic Scenarios (comparable)")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+    axes[1].text(0.02, 0.98, "✓ 相同流量场景，可以直接比较",
+                 transform=axes[1].transAxes, fontsize=9, verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
+    
+    plt.tight_layout()
     fig_path = os.path.join("results", "ppo_reward_curve.png")
-    plt.savefig(fig_path)
+    plt.savefig(fig_path, dpi=150)
     plt.close()
     print(f"[PPO] 收敛曲线已保存到 {fig_path}")
+    
+    # 图1.5：相对改善率曲线
+    plt.figure(figsize=(12, 6))
+    plt.plot(eval_episodes, eval_improvement, linewidth=2, marker='s', markersize=6,
+             color='blue', label='Improvement over baseline')
+    plt.axhline(y=0, color='red', linestyle='--', linewidth=1.5, alpha=0.7, label='Baseline (0%)')
+    plt.xlabel("Episode")
+    plt.ylabel("Improvement (%)")
+    plt.title("PPO Performance Improvement over Traditional Scheduling")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    fig_path = os.path.join("results", "ppo_improvement_curve.png")
+    plt.savefig(fig_path, dpi=150)
+    plt.close()
+    print(f"[PPO] 改善率曲线已保存到 {fig_path}")
+    
+    # 图2：Advantage统计（训练质量指标）
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # 提取advantage统计数据
+    adv_means = [s['mean'] for s in advantage_stats]
+    adv_stds = [s['std'] for s in advantage_stats]
+    adv_maxs = [s['max'] for s in advantage_stats]
+    adv_mins = [s['min'] for s in advantage_stats]
+    episodes = list(range(len(advantage_stats)))
+    
+    # 子图1：Advantage均值（应该接近0）
+    axes[0, 0].plot(episodes, adv_means, linewidth=2, color='blue')
+    axes[0, 0].axhline(y=0, color='red', linestyle='--', alpha=0.5, label='Target (0)')
+    axes[0, 0].set_xlabel("Episode")
+    axes[0, 0].set_ylabel("Advantage Mean")
+    axes[0, 0].set_title("Advantage Mean (should be near 0)")
+    axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].legend()
+    
+    # 子图2：Advantage标准差（反映策略稳定性）
+    axes[0, 1].plot(episodes, adv_stds, linewidth=2, color='green')
+    axes[0, 1].set_xlabel("Episode")
+    axes[0, 1].set_ylabel("Advantage Std")
+    axes[0, 1].set_title("Advantage Std (training stability indicator)")
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # 子图3：Advantage范围（max和min）
+    axes[1, 0].plot(episodes, adv_maxs, linewidth=2, color='red', label='Max', alpha=0.7)
+    axes[1, 0].plot(episodes, adv_mins, linewidth=2, color='blue', label='Min', alpha=0.7)
+    axes[1, 0].fill_between(episodes, adv_mins, adv_maxs, alpha=0.2)
+    axes[1, 0].set_xlabel("Episode")
+    axes[1, 0].set_ylabel("Advantage Value")
+    axes[1, 0].set_title("Advantage Range (Max & Min)")
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].legend()
+    
+    # 子图4：Reward和Advantage Std的关系（双Y轴）
+    ax1 = axes[1, 1]
+    ax2 = ax1.twinx()
+    
+    line1 = ax1.plot(episodes, episode_rewards, linewidth=2, color='purple', label='Reward', alpha=0.8)
+    line2 = ax2.plot(episodes, adv_stds, linewidth=2, color='orange', label='Adv Std', alpha=0.8)
+    
+    ax1.set_xlabel("Episode")
+    ax1.set_ylabel("Average Reward", color='purple')
+    ax2.set_ylabel("Advantage Std", color='orange')
+    ax1.tick_params(axis='y', labelcolor='purple')
+    ax2.tick_params(axis='y', labelcolor='orange')
+    ax1.set_title("Reward vs Advantage Std")
+    ax1.grid(True, alpha=0.3)
+    
+    # 合并图例
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='best')
+    
+    plt.tight_layout()
+    fig_path = os.path.join("results", "ppo_advantage_analysis.png")
+    plt.savefig(fig_path, dpi=150)
+    plt.close()
+    print(f"[PPO] Advantage分析图已保存到 {fig_path}")
+    
+    # 图3：新增综合分析图 - 固定流量评估 + 原始Advantage统计（未归一化）
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # 提取原始advantage和return统计数据
+    raw_adv_means = [s['mean'] for s in raw_advantage_stats]
+    raw_adv_stds = [s['std'] for s in raw_advantage_stats]
+    raw_adv_maxs = [s['max'] for s in raw_advantage_stats]
+    raw_adv_mins = [s['min'] for s in raw_advantage_stats]
+    
+    raw_ret_means = [s['mean'] for s in raw_return_stats]
+    raw_ret_stds = [s['std'] for s in raw_return_stats]
+    raw_ret_maxs = [s['max'] for s in raw_return_stats]
+    raw_ret_mins = [s['min'] for s in raw_return_stats]
+    
+    # 子图1：固定评估集Reward（真正的收敛指标）
+    ax = axes[0, 0]
+    eval_episodes = [i * eval_frequency for i in range(len(eval_rewards))]
+    if len(eval_episodes) > 0 and eval_episodes[0] != 0:
+        eval_episodes = [0] + eval_episodes
+    ax.plot(eval_episodes, eval_rewards, linewidth=2.5, marker='o', markersize=8,
+            label="PPO策略 (固定流量评估)", color='green', markerfacecolor='white', 
+            markeredgewidth=2)
+    ax.axhline(y=baseline_avg, color='red', linestyle='--', linewidth=2.5,
+               label=f'Baseline: {baseline_avg:.6f}', alpha=0.8)
+    ax.set_xlabel("Episode", fontsize=12)
+    ax.set_ylabel("Average Reward", fontsize=12)
+    ax.set_title("固定流量评估Reward（真实收敛曲线）", fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10, loc='best')
+    ax.text(0.02, 0.02, "✓ 这条线能反映真实的策略改进", 
+            transform=ax.transAxes, fontsize=10, verticalalignment='bottom',
+            bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.5))
+    
+    # 子图2：原始Advantage均值趋势（未归一化）
+    ax = axes[0, 1]
+    ax.plot(episodes, raw_adv_means, linewidth=2, color='darkblue', alpha=0.8)
+    ax.set_xlabel("Episode", fontsize=12)
+    ax.set_ylabel("Raw Advantage Mean", fontsize=12)
+    ax.set_title("原始Advantage均值（未归一化）", fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.text(0.02, 0.98, "说明：这是归一化前的真实advantage值\n如果策略改善，期望看到上升趋势", 
+            transform=ax.transAxes, fontsize=9, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.5))
+    
+    # 子图3：原始Return均值趋势（未归一化）
+    ax = axes[1, 0]
+    ax.plot(episodes, raw_ret_means, linewidth=2, color='purple', alpha=0.8)
+    # 添加移动平均线以显示趋势
+    if len(raw_ret_means) >= 10:
+        window = 10
+        smoothed = np.convolve(raw_ret_means, np.ones(window)/window, mode='valid')
+        smooth_episodes = episodes[window-1:]
+        ax.plot(smooth_episodes, smoothed, linewidth=2.5, color='red', 
+                label=f'{window}-episode moving average', alpha=0.9)
+        ax.legend(fontsize=10)
+    ax.set_xlabel("Episode", fontsize=12)
+    ax.set_ylabel("Raw Return Mean", fontsize=12)
+    ax.set_title("原始Return均值（未归一化）", fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.text(0.02, 0.98, "说明：累积折扣回报的真实值\n上升趋势说明策略在改善", 
+            transform=ax.transAxes, fontsize=9, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.5))
+    
+    # 子图4：原始Advantage标准差（反映价值估计的不确定性）
+    ax = axes[1, 1]
+    ax.plot(episodes, raw_adv_stds, linewidth=2, color='orange', alpha=0.8)
+    # 添加移动平均线
+    if len(raw_adv_stds) >= 10:
+        window = 10
+        smoothed = np.convolve(raw_adv_stds, np.ones(window)/window, mode='valid')
+        smooth_episodes = episodes[window-1:]
+        ax.plot(smooth_episodes, smoothed, linewidth=2.5, color='darkred', 
+                label=f'{window}-episode moving average', alpha=0.9)
+        ax.legend(fontsize=10)
+    ax.set_xlabel("Episode", fontsize=12)
+    ax.set_ylabel("Raw Advantage Std", fontsize=12)
+    ax.set_title("原始Advantage标准差（未归一化）", fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.text(0.02, 0.98, "说明：价值估计的波动幅度\n趋于稳定说明策略和价值估计收敛", 
+            transform=ax.transAxes, fontsize=9, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='lightpink', alpha=0.5))
+    
+    plt.tight_layout()
+    fig_path = os.path.join("results", "ppo_convergence_comprehensive.png")
+    plt.savefig(fig_path, dpi=150)
+    plt.close()
+    print(f"[PPO] 综合收敛分析图已保存到 {fig_path}")
+    
+    # 生成训练诊断报告
+    print("\n" + "="*70)
+    print("📊 PPO训练诊断报告")
+    print("="*70)
+    
+    # 1. 固定评估集性能分析（最重要！）
+    if len(eval_rewards) > 1:
+        eval_improvement_value = eval_rewards[-1] - eval_rewards[0]
+        final_improvement_pct = eval_improvement[-1] if len(eval_improvement) > 0 else 0
+        print(f"\n【固定评估集性能】⭐ (可比较的真实指标)")
+        print(f"  Baseline (传统调度): {baseline_avg:.6f}")
+        print(f"  初始PPO性能: {eval_rewards[0]:.6f}")
+        print(f"  最终PPO性能: {eval_rewards[-1]:.6f}")
+        print(f"  绝对改善: {eval_improvement_value:.6f}")
+        print(f"  相对baseline改善: {final_improvement_pct:+.2f}%")
+        if final_improvement_pct > 5:
+            print(f"  ✓ PPO显著优于传统调度")
+        elif final_improvement_pct > 0:
+            print(f"  ⚠ PPO略优于传统调度")
+        else:
+            print(f"  ✗ PPO未超过传统调度")
+    
+    # 2. 训练过程Reward分析（仅供参考）
+    reward_improvement = episode_rewards[-1] - episode_rewards[0] if len(episode_rewards) > 0 else 0
+    print(f"\n【训练过程Reward】(随机流量，仅供参考)")
+    print(f"  初始: {episode_rewards[0]:.6f}")
+    print(f"  最终: {episode_rewards[-1]:.6f}")
+    print(f"  变化: {reward_improvement:.6f}")
+    print(f"  ⚠ 注意：每个episode流量不同，此数值不能直接比较")
+    
+    # 2. Advantage稳定性分析
+    first_10_std = np.mean([s['std'] for s in advantage_stats[:10]])
+    last_10_std = np.mean([s['std'] for s in advantage_stats[-10:]])
+    std_change = last_10_std - first_10_std
+    stability_trend = "改善✓" if std_change < 0 else "未改善✗"
+    
+    print(f"\n【Advantage稳定性分析】")
+    print(f"  前10轮平均Std: {first_10_std:.6f}")
+    print(f"  后10轮平均Std: {last_10_std:.6f}")
+    print(f"  变化: {std_change:.6f} ({stability_trend})")
+    
+    # 3. Advantage范围分析
+    first_10_range = np.mean([s['max'] - s['min'] for s in advantage_stats[:10]])
+    last_10_range = np.mean([s['max'] - s['min'] for s in advantage_stats[-10:]])
+    range_change = last_10_range - first_10_range
+    range_trend = "收窄✓" if range_change < 0 else "未收窄✗"
+    
+    print(f"\n【Advantage范围分析】")
+    print(f"  前10轮平均范围: {first_10_range:.4f}")
+    print(f"  后10轮平均范围: {last_10_range:.4f}")
+    print(f"  变化: {range_change:.4f} ({range_trend})")
+    
+    # 3.5 原始Advantage和Return分析（未归一化）
+    first_10_raw_adv = np.mean([s['mean'] for s in raw_advantage_stats[:10]])
+    last_10_raw_adv = np.mean([s['mean'] for s in raw_advantage_stats[-10:]])
+    raw_adv_change = last_10_raw_adv - first_10_raw_adv
+    
+    first_10_raw_ret = np.mean([s['mean'] for s in raw_return_stats[:10]])
+    last_10_raw_ret = np.mean([s['mean'] for s in raw_return_stats[-10:]])
+    raw_ret_change = last_10_raw_ret - first_10_raw_ret
+    
+    print(f"\n【原始价值估计分析】(未归一化)")
+    print(f"  原始Advantage均值变化:")
+    print(f"    前10轮: {first_10_raw_adv:.6f}")
+    print(f"    后10轮: {last_10_raw_adv:.6f}")
+    print(f"    变化: {raw_adv_change:+.6f} {'↑' if raw_adv_change > 0 else '↓'}")
+    print(f"  原始Return均值变化:")
+    print(f"    前10轮: {first_10_raw_ret:.6f}")
+    print(f"    后10轮: {last_10_raw_ret:.6f}")
+    print(f"    变化: {raw_ret_change:+.6f} {'↑' if raw_ret_change > 0 else '↓'}")
+    if raw_adv_change > 0 and raw_ret_change > 0:
+        print(f"  ✓ 价值估计显示策略改善趋势")
+    elif raw_adv_change > 0 or raw_ret_change > 0:
+        print(f"  ⚠ 价值估计显示部分改善")
+    else:
+        print(f"  ✗ 价值估计未显示明显改善")
+    
+    # 4. 训练质量总结
+    print(f"\n【训练质量总结】")
+    
+    # 基于固定评估集判断
+    if len(eval_rewards) > 1:
+        if final_improvement_pct > 5:
+            print(f"  ✓ 策略性能显著改善（相对baseline +{final_improvement_pct:.1f}%）")
+        elif final_improvement_pct > 0:
+            print(f"  ⚠ 策略性能轻微改善（相对baseline +{final_improvement_pct:.1f}%）")
+        else:
+            print(f"  ✗ 策略未超过baseline")
+    
+    if std_change < -0.01:
+        print(f"  ✓ 策略趋于稳定")
+    elif abs(std_change) < 0.01:
+        print(f"  ⚠ 策略稳定性无明显变化")
+    else:
+        print(f"  ✗ 策略不稳定")
+    
+    if range_change < -0.5:
+        print(f"  ✓ 动作质量趋于一致")
+    elif abs(range_change) < 0.5:
+        print(f"  ⚠ 动作质量无明显变化")
+    else:
+        print(f"  ✗ 动作质量参差不齐")
+    
+    # 5. 改进建议
+    print(f"\n【改进建议】")
+    if len(eval_rewards) > 1 and final_improvement_pct < 5:
+        print(f"  • 增加训练轮数 (当前: {cfg.total_episodes}, 建议: {cfg.total_episodes*5})")
+        print(f"  • 调整奖励函数权重 (VO:{cfg.w_vo}, VI:{cfg.w_vi}, BE:{cfg.w_be})")
+    if std_change >= 0:
+        print(f"  • 降低学习率 (当前: {cfg.lr}, 建议: {cfg.lr/2:.2e})")
+        print(f"  • 减小clip范围 (当前: {cfg.clip_eps}, 建议: 0.1)")
+    if abs(std_change) < 0.01:
+        print(f"  • 增加熵系数鼓励探索 (建议: 0.05)")
+    
+    print("="*70 + "\n")
 
     return model, episode_rewards
 
@@ -898,12 +1353,14 @@ def evaluate_policy(env_cfg: PPOConfig, model: nn.Module = None, use_traditional
     - enable_tracking=True：返回详细的调度追踪数据
     
     Returns:
-        如果 enable_tracking=False: 返回 total_reward
+        如果 enable_tracking=False: 返回 total_reward（原始reward）
         如果 enable_tracking=True: 返回 (total_reward, tracker)
     """
     device = torch.device(env_cfg.device)
     set_global_seeds(seed)
-    env = RLSchedulingEnv(env_cfg, use_traditional=use_traditional, enable_tracking=enable_tracking)
+    # 评估时不使用reward归一化，直接用原始reward比较
+    env = RLSchedulingEnv(env_cfg, use_traditional=use_traditional, 
+                         enable_tracking=enable_tracking, normalize_reward=False)
     obs = env.reset(seed=seed)
     total_reward = 0.0
 
@@ -1000,7 +1457,7 @@ def visualize_comparison(tracker_traditional: ScheduleTracker,
     plt.close()
     print(f"[Visualization] 队列流量对比图已保存到 {fig_path}")
     
-    # === 图3: 调度选择分布对比 ===
+    # === 图3: 调度选择分布对比（折线图）===
     summary_trad = tracker_traditional.summary()
     summary_ppo = tracker_ppo.summary()
     
@@ -1013,11 +1470,10 @@ def visualize_comparison(tracker_traditional: ScheduleTracker,
     counts_ppo = [dist_ppo.get(k, 0) for k in all_keys]
     
     x = np.arange(len(all_keys))
-    width = 0.35
     
     fig, ax = plt.subplots(figsize=(10, 6))
-    bars1 = ax.bar(x - width/2, counts_trad, width, label='Traditional', alpha=0.8)
-    bars2 = ax.bar(x + width/2, counts_ppo, width, label='PPO', alpha=0.8)
+    ax.plot(x, counts_trad, marker='o', markersize=8, linewidth=2, label='Traditional', alpha=0.8)
+    ax.plot(x, counts_ppo, marker='s', markersize=8, linewidth=2, label='PPO', alpha=0.8)
     
     ax.set_xlabel('Access Category')
     ax.set_ylabel('Scheduling Count')
@@ -1025,16 +1481,14 @@ def visualize_comparison(tracker_traditional: ScheduleTracker,
     ax.set_xticks(x)
     ax.set_xticklabels(all_keys)
     ax.legend()
-    ax.grid(True, alpha=0.3, axis='y')
+    ax.grid(True, alpha=0.3)
     
-    # 在柱子上添加数值标签
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0:
-                ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{int(height)}',
-                       ha='center', va='bottom', fontsize=8)
+    # 添加数值标签
+    for i, (trad_val, ppo_val) in enumerate(zip(counts_trad, counts_ppo)):
+        if trad_val > 0:
+            ax.text(i, trad_val, f'{int(trad_val)}', ha='center', va='bottom', fontsize=8)
+        if ppo_val > 0:
+            ax.text(i, ppo_val, f'{int(ppo_val)}', ha='center', va='bottom', fontsize=8)
     
     plt.tight_layout()
     fig_path = os.path.join(save_dir, "schedule_distribution_comparison.png")
@@ -1130,7 +1584,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str,
                         choices=["baseline", "train_ppo", "compare"],
-                        default="compare")
+                        default="train_ppo")
     args = parser.parse_args()
 
     if args.mode == "baseline":
